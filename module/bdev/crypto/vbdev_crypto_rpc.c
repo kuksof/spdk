@@ -156,6 +156,7 @@ out:
 static int
 get_kek_bytes(const char *kek_id, const char *kek_hex, uint8_t **out_kek, size_t *out_len)
 {
+	struct spdk_key *key = NULL;
 	uint8_t *kek = NULL;
 	size_t len = 0;
 	int rc;
@@ -169,16 +170,32 @@ get_kek_bytes(const char *kek_id, const char *kek_hex, uint8_t **out_kek, size_t
 
 	/* Preferred: fetch KEK from SPDK keyring by id */
 	if (kek_id && kek_id[0] != '\0') {
-		rc = spdk_keyring_get_key(kek_id, (void **)&kek, &len);
-		if (rc != 0) {
-			SPDK_ERRLOG("Failed to get KEK from keyring by kek_id='%s' rc=%d\n", kek_id, rc);
+		key = spdk_keyring_get_key(kek_id);
+		if (key == NULL) {
+			SPDK_ERRLOG("Failed to get KEK from keyring by kek_id='%s'\n", kek_id);
+			return -ENOENT;
+		}
+
+		kek = calloc(1, 32);
+		if (kek == NULL) {
+			spdk_keyring_put_key(key);
+			return -ENOMEM;
+		}
+
+		rc = spdk_key_get_key(key, kek, 32);
+		spdk_keyring_put_key(key);
+
+		if (rc < 0) {
+			SPDK_ERRLOG("Failed to read KEK bytes from keyring kek_id='%s' rc=%d\n", kek_id, rc);
+			spdk_memset_s(kek, 32, 0, 32);
+			free(kek);
 			return rc;
 		}
 
-		if (len != 32) {
+		if (rc != 32) {
 			SPDK_ERRLOG("KEK from keyring must be %u bytes for AES-256-GCM, got %zu\n",
-				    32, len);
-			spdk_memset_s(kek, len, 0, len);
+				    32, rc);
+			spdk_memset_s(kek, 32, 0, 32);
 			free(kek);
 			return -EINVAL;
 		}
