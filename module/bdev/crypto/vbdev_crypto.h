@@ -18,6 +18,7 @@
 #include "spdk/bdev.h"
 
 #define BDEV_CRYPTO_DEFAULT_CIPHER "AES_CBC" /* QAT and AESNI_MB */
+#define VBDEV_CRYPTO_DEK_FP_LEN 32
 
 /* Structure to hold crypto options */
 struct vbdev_crypto_opts {
@@ -25,6 +26,13 @@ struct vbdev_crypto_opts {
 	char				*bdev_name;	/* base bdev name */
 	struct spdk_accel_crypto_key	*key;		/* crypto key */
 	bool				key_owner;	/* If wet to true then the key was created by RPC and needs to be destroyed */
+
+	char *kek_id;              /* preferred */
+	char *wrapped_key_b64;
+	char *wrapped_key2_b64;
+
+	uint8_t dek_fp[VBDEV_CRYPTO_DEK_FP_LEN]; /* SHA-256(key||key2) */
+	bool dek_fp_valid;
 };
 
 typedef void (*spdk_delete_crypto_complete)(void *cb_arg, int bdeverrno);
@@ -66,5 +74,7 @@ create_crypto_opts_by_name(char *name, char *base_bdev_name, struct spdk_accel_c
  * \param opts Crypto opts to release
  */
 void free_crypto_opts(struct vbdev_crypto_opts *opts);
+
+struct vbdev_crypto_opts *vbdev_crypto_get_opts_by_name(const char *vbdev_name);
 
 #endif /* SPDK_VBDEV_CRYPTO_H */

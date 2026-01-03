@@ -96,6 +96,64 @@ create_crypto_opts(struct rpc_construct_crypto *rpc, struct spdk_accel_crypto_ke
 }
 
 static int
+calc_dek_fp_from_hex(const char *hex1, const char *hex2, uint8_t out_fp[VBDEV_CRYPTO_DEK_FP_LEN])
+{
+    uint8_t *k1 = NULL, *k2 = NULL;
+    size_t k1_len = 0, k2_len = 0;
+    EVP_MD_CTX *md = NULL;
+    unsigned int md_len = 0;
+    int rc = -EINVAL;
+
+    if (!hex1 || !hex2 || !out_fp) {
+        return -EINVAL;
+    }
+    if ((strlen(hex1) % 2) || (strlen(hex2) % 2)) {
+        return -EINVAL;
+    }
+
+    k1_len = strlen(hex1) / 2;
+    k2_len = strlen(hex2) / 2;
+
+    k1 = (uint8_t *)spdk_unhexlify(hex1);
+    k2 = (uint8_t *)spdk_unhexlify(hex2);
+    if (!k1 || !k2) {
+        rc = -ENOMEM;
+        goto out;
+    }
+
+    md = EVP_MD_CTX_new();
+    if (!md) {
+        rc = -ENOMEM;
+        goto out;
+    }
+
+    if (EVP_DigestInit_ex(md, EVP_sha256(), NULL) != 1 ||
+        EVP_DigestUpdate(md, k1, k1_len) != 1 ||
+        EVP_DigestUpdate(md, k2, k2_len) != 1 ||
+        EVP_DigestFinal_ex(md, out_fp, &md_len) != 1 ||
+        md_len != VBDEV_CRYPTO_DEK_FP_LEN) {
+        rc = -EINVAL;
+        goto out;
+    }
+
+    rc = 0;
+
+out:
+    if (md) {
+        EVP_MD_CTX_free(md);
+    }
+    if (k1) {
+        spdk_memset_s(k1, k1_len, 0, k1_len);
+        free(k1);
+    }
+    if (k2) {
+        spdk_memset_s(k2, k2_len, 0, k2_len);
+        free(k2);
+    }
+    return rc;
+}
+
+static int
 get_kek_bytes(const char *kek_id, const char *kek_hex, uint8_t **out_kek, size_t *out_len)
 {
 	uint8_t *kek = NULL;
@@ -383,6 +441,27 @@ rpc_bdev_crypto_create(struct spdk_jsonrpc_request *request,
 				}
 				req.param.hex_key2 = hex2;
 			}
+
+			if (req.kek_id && req.kek_id[0] != '\0') {
+				crypto_opts->kek_id = strdup(req.kek_id);
+			}
+			if (req.wrapped_key_b64) {
+				crypto_opts->wrapped_key_b64 = strdup(req.wrapped_key_b64);
+			}
+			if (req.wrapped_key2_b64) {
+				crypto_opts->wrapped_key2_b64 = strdup(req.wrapped_key2_b64);
+			}
+
+			if (req.param.hex_key && req.param.hex_key2) {
+				rc = calc_dek_fp_from_hex(req.param.hex_key, req.param.hex_key2, crypto_opts->dek_fp);
+				if (rc != 0) {
+					spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+												 	"Failed to calculate DEK fingerprint");
+					free_crypto_opts(crypto_opts);
+					goto cleanup;
+				}
+				crypto_opts->dek_fp_valid = true;
+			}
 		}
 
 		if (req.param.cipher == NULL) {
@@ -452,6 +531,127 @@ cleanup:
 	free_rpc_construct_crypto(&req);
 }
 SPDK_RPC_REGISTER("bdev_crypto_create", rpc_bdev_crypto_create, SPDK_RPC_RUNTIME)
+
+struct rpc_crypto_update_wrapped {
+	char *name;
+	char *kek_id;
+	char *kek_hex;            /* fallback */
+	char *wrapped_key_b64;
+	char *wrapped_key2_b64;
+};
+
+static void
+free_rpc_crypto_update_wrapped(struct rpc_crypto_update_wrapped *r)
+{
+	free(r->name);
+	free(r->kek_id);
+	free(r->kek_hex);
+	free(r->wrapped_key_b64);
+	free(r->wrapped_key2_b64);
+}
+
+static const struct spdk_json_object_decoder rpc_crypto_update_wrapped_decoders[] = {
+	{"name", offsetof(struct rpc_crypto_update_wrapped, name), spdk_json_decode_string},
+	{"kek_id", offsetof(struct rpc_crypto_update_wrapped, kek_id), spdk_json_decode_string, true},
+	{"kek_hex", offsetof(struct rpc_crypto_update_wrapped, kek_hex), spdk_json_decode_string, true},
+	{"wrapped_key", offsetof(struct rpc_crypto_update_wrapped, wrapped_key_b64), spdk_json_decode_string},
+	{"wrapped_key2", offsetof(struct rpc_crypto_update_wrapped, wrapped_key2_b64), spdk_json_decode_string},
+};
+
+static void
+rpc_bdev_crypto_update_wrapped_keys(struct spdk_jsonrpc_request *request,
+                                   const struct spdk_json_val *params)
+{
+	struct rpc_crypto_update_wrapped req = {};
+	struct vbdev_crypto_opts *opts;
+	char *hex1 = NULL, *hex2 = NULL;
+	uint8_t fp[VBDEV_CRYPTO_DEK_FP_LEN];
+	int rc;
+
+	if (spdk_json_decode_object(params, rpc_crypto_update_wrapped_decoders,
+                                SPDK_COUNTOF(rpc_crypto_update_wrapped_decoders),
+                                &req)) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_PARSE_ERROR,
+                                         "Failed to decode params");
+		goto out;
+	}
+
+	if (!req.name) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+                                         "name is required");
+		goto out;
+	}
+
+	if ((!req.kek_id || req.kek_id[0] == '\0') && (!req.kek_hex || req.kek_hex[0] == '\0')) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+                                         "kek_id (preferred) or kek_hex (fallback) is required");
+		goto out;
+	}
+
+	opts = vbdev_crypto_get_opts_by_name(req.name);
+	if (!opts) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+                                         "crypto bdev not found");
+		goto out;
+	}
+
+	if (!opts->dek_fp_valid) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+                                         "DEK fingerprint is not available for this bdev");
+		goto out;
+	}
+
+	rc = decrypt_wrapped_key_to_hex(req.wrapped_key_b64, req.kek_id, req.kek_hex, &hex1);
+	if (rc != 0) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+                                         "Failed to decrypt wrapped_key");
+		goto out;
+	}
+
+	rc = decrypt_wrapped_key_to_hex(req.wrapped_key2_b64, req.kek_id, req.kek_hex, &hex2);
+	if (rc != 0) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+                                         "Failed to decrypt wrapped_key2");
+		goto out;
+	}
+
+	rc = calc_dek_fp_from_hex(hex1, hex2, fp);
+	if (rc != 0) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+                                         "Failed to calculate DEK fingerprint");
+		goto out;
+	}
+
+	if (memcmp(fp, opts->dek_fp, VBDEV_CRYPTO_DEK_FP_LEN) != 0) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+                                         "Plaintext DEK changed (not a rewrap). Refusing.");
+		goto out;
+	}
+
+	/* update metadata */
+	free(opts->kek_id);
+	free(opts->wrapped_key_b64);
+	free(opts->wrapped_key2_b64);
+
+	opts->kek_id = req.kek_id ? strdup(req.kek_id) : NULL;
+	opts->wrapped_key_b64 = strdup(req.wrapped_key_b64);
+	opts->wrapped_key2_b64 = strdup(req.wrapped_key2_b64);
+
+	spdk_jsonrpc_send_bool_response(request, true);
+
+out:
+	if (hex1) {
+		spdk_memset_s(hex1, strlen(hex1), 0, strlen(hex1));
+		free(hex1);
+	}
+	if (hex2) {
+		spdk_memset_s(hex2, strlen(hex2), 0, strlen(hex2));
+		free(hex2);
+	}
+	free_rpc_crypto_update_wrapped(&req);
+}
+
+SPDK_RPC_REGISTER("bdev_crypto_update_wrapped_keys", rpc_bdev_crypto_update_wrapped_keys, SPDK_RPC_RUNTIME)
 
 struct rpc_delete_crypto {
 	char *name;

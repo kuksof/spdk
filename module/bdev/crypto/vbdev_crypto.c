@@ -11,6 +11,7 @@
 #include "spdk/thread.h"
 #include "spdk/bdev_module.h"
 #include "spdk/likely.h"
+#include <string.h>
 
 /* This namespace UUID was generated using uuid_generate() method. */
 #define BDEV_CRYPTO_NAMESPACE_UUID "078e3cf7-f4b4-4545-b2c3-d40045a64ae2"
@@ -578,11 +579,29 @@ vbdev_crypto_insert_name(struct vbdev_crypto_opts *opts, struct bdev_names **out
 	return 0;
 }
 
+struct vbdev_crypto_opts *
+vbdev_crypto_get_opts_by_name(const char *vbdev_name)
+{
+	struct vbdev_crypto *c;
+
+	TAILQ_FOREACH(c, &g_vbdev_crypto, link) {
+		if (strcmp(c->crypto_bdev.name, vbdev_name) == 0) {
+			return c->opts;
+		}
+	}
+	return NULL;
+}
+
 void
 free_crypto_opts(struct vbdev_crypto_opts *opts)
 {
 	free(opts->bdev_name);
 	free(opts->vbdev_name);
+	if (opts->kek_id) { free(opts->kek_id); }
+	if (opts->wrapped_key_b64) { free(opts->wrapped_key_b64); }
+	if (opts->wrapped_key2_b64) { free(opts->wrapped_key2_b64); }
+	spdk_memset_s(opts->dek_fp, sizeof(opts->dek_fp), 0, sizeof(opts->dek_fp));
+	opts->dek_fp_valid = false;
 	free(opts);
 }
 
