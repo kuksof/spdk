@@ -8,6 +8,12 @@
 #include "vbdev_crypto.h"
 
 #include "spdk/hexlify.h"
+#include "spdk/keyring.h"
+
+#include "spdk/base64.h"
+#include "spdk/util.h"
+
+#include <openssl/evp.h>
 
 /* Reasonable bdev name length + cipher's name len */
 #define MAX_KEY_NAME_LEN 128
@@ -18,6 +24,10 @@ struct rpc_construct_crypto {
 	char *name;
 	char *crypto_pmd;
 	struct spdk_accel_crypto_key_create_param param;
+	char *wrapped_key_b64;
+	char *wrapped_key2_b64;
+	char *kek_id;
+	char *kek_hex;
 };
 
 /* Free the allocated memory resource after the RPC handling. */
@@ -37,6 +47,10 @@ free_rpc_construct_crypto(struct rpc_construct_crypto *r)
 		free(r->param.hex_key2);
 	}
 	free(r->param.key_name);
+	free(r->wrapped_key_b64);
+	free(r->wrapped_key2_b64);
+	free(r->kek_id);
+	free(r->kek_hex);
 }
 
 /* Structure to decode the input parameters for this RPC method. */
@@ -48,6 +62,10 @@ static const struct spdk_json_object_decoder rpc_bdev_crypto_create_decoders[] =
 	{"cipher", offsetof(struct rpc_construct_crypto, param.cipher), spdk_json_decode_string, true},
 	{"key2", offsetof(struct rpc_construct_crypto, param.hex_key2), spdk_json_decode_string, true},
 	{"key_name", offsetof(struct rpc_construct_crypto, param.key_name), spdk_json_decode_string, true},
+	{"wrapped_key", offsetof(struct rpc_construct_crypto, wrapped_key_b64), spdk_json_decode_string, true},
+	{"wrapped_key2", offsetof(struct rpc_construct_crypto, wrapped_key2_b64), spdk_json_decode_string, true},
+	{"kek_id", offsetof(struct rpc_construct_crypto, kek_id), spdk_json_decode_string, true},
+	{"kek_hex", offsetof(struct rpc_construct_crypto, kek_hex), spdk_json_decode_string, true},
 };
 
 static struct vbdev_crypto_opts *
@@ -75,6 +93,218 @@ create_crypto_opts(struct rpc_construct_crypto *rpc, struct spdk_accel_crypto_ke
 	opts->key_owner = key_owner;
 
 	return opts;
+}
+
+static int
+get_kek_bytes(const char *kek_id, const char *kek_hex, uint8_t **out_kek, size_t *out_len)
+{
+	uint8_t *kek = NULL;
+	size_t len = 0;
+	int rc;
+
+	if (out_kek == NULL || out_len == NULL) {
+		return -EINVAL;
+	}
+
+	*out_kek = NULL;
+	*out_len = 0;
+
+	/* Preferred: fetch KEK from SPDK keyring by id */
+	if (kek_id && kek_id[0] != '\0') {
+		rc = spdk_keyring_get_key(kek_id, (void **)&kek, &len);
+		if (rc != 0) {
+			SPDK_ERRLOG("Failed to get KEK from keyring by kek_id='%s' rc=%d\n", kek_id, rc);
+			return rc;
+		}
+
+		if (len != 32) {
+			SPDK_ERRLOG("KEK from keyring must be %u bytes for AES-256-GCM, got %zu\n",
+				    32, len);
+			spdk_memset_s(kek, len, 0, len);
+			free(kek);
+			return -EINVAL;
+		}
+
+		*out_kek = kek;
+		*out_len = len;
+		return 0;
+	}
+
+	/* Fallback: accept kek_hex (NOT preferred, but ok) */
+	SPDK_ERRLOG("Failed to get KEK from keyring by kek_id='%s'\n", kek_id);
+	if (kek_hex && kek_hex[0] != '\0') {
+		if (strlen(kek_hex) % 2 != 0) {
+			SPDK_ERRLOG("kek_hex length must be even\n");
+			return -EINVAL;
+		}
+
+		len = strlen(kek_hex) / 2;
+		if (len != 32) {
+			SPDK_ERRLOG("kek_hex must be %u bytes (64 hex chars), got %zu bytes\n",
+				    32, len);
+			return -EINVAL;
+		}
+
+		kek = (uint8_t *)spdk_unhexlify(kek_hex);
+		if (kek == NULL) {
+			SPDK_ERRLOG("Failed to unhexlify kek_hex\n");
+			return -EINVAL;
+		}
+
+		*out_kek = kek;
+		*out_len = len;
+		return 0;
+	}
+
+	SPDK_ERRLOG("Neither kek_id nor kek_hex provided\n");
+	return -EINVAL;
+}
+
+static int
+decrypt_wrapped_key_to_hex(const char *wrapped_b64, const char *kek_id, const char *kek_hex, char **out_hex)
+{
+	EVP_CIPHER_CTX *ctx = NULL;
+	uint8_t *blob = NULL;
+	size_t blob_len = 0;
+
+	uint8_t *kek_bin = NULL;
+	size_t kek_len = 0;
+
+	uint8_t *pt = NULL;
+	int pt_len = 0;
+	int len = 0;
+
+	const uint8_t *iv = NULL;
+	const uint8_t *tag = NULL;
+	const uint8_t *ct = NULL;
+	size_t ct_len = 0;
+
+	int rc = -EINVAL;
+
+	if (!wrapped_b64 || !out_hex) {
+		return -EINVAL;
+	}
+
+	*out_hex = NULL;
+
+	rc = get_kek_bytes(kek_id, kek_hex, &kek_bin, &kek_len);
+	if (rc != 0) {
+		SPDK_ERRLOG("Failed to obtain KEK\n");
+		goto cleanup;
+	}
+
+	/* Decode base64(wrapped_blob). Format:
+	 * [0..11]   IV (12 bytes)
+	 * [12..27]  TAG (16 bytes)
+	 * [28..]    Ciphertext
+	 */
+	blob_len = spdk_base64_get_decoded_len(strlen(wrapped_b64));
+	if (blob_len < (12 + 16 + 1)) {
+		SPDK_ERRLOG("wrapped_key blob too small\n");
+		rc = -EINVAL;
+		goto cleanup;
+	}
+
+	blob = calloc(1, blob_len);
+	if (!blob) {
+		rc = -ENOMEM;
+		goto cleanup;
+	}
+
+	if (spdk_base64_decode(blob, &blob_len, wrapped_b64) != 0) {
+		SPDK_ERRLOG("Failed to base64 decode wrapped_key\n");
+		rc = -EINVAL;
+		goto cleanup;
+	}
+
+	if (blob_len < (12 + 16 + 1)) {
+		SPDK_ERRLOG("wrapped_key decoded blob too small\n");
+		rc = -EINVAL;
+		goto cleanup;
+	}
+
+	iv = blob;
+	tag = blob + 12;
+	ct = blob + 12 + 16;
+	ct_len = blob_len - (12 + 16);
+
+	pt = calloc(1, ct_len);
+	if (!pt) {
+		rc = -ENOMEM;
+		goto cleanup;
+	}
+
+	ctx = EVP_CIPHER_CTX_new();
+	if (!ctx) {
+		rc = -ENOMEM;
+		goto cleanup;
+	}
+
+	if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1) {
+		SPDK_ERRLOG("EVP_DecryptInit_ex failed\n");
+		rc = -EINVAL;
+		goto cleanup;
+	}
+
+	if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL) != 1) {
+		SPDK_ERRLOG("EVP_CTRL_GCM_SET_IVLEN failed\n");
+		rc = -EINVAL;
+		goto cleanup;
+	}
+
+	if (EVP_DecryptInit_ex(ctx, NULL, NULL, kek_bin, iv) != 1) {
+		SPDK_ERRLOG("EVP_DecryptInit_ex(key,iv) failed\n");
+		rc = -EINVAL;
+		goto cleanup;
+	}
+
+	if (EVP_DecryptUpdate(ctx, pt, &len, ct, (int)ct_len) != 1) {
+		SPDK_ERRLOG("EVP_DecryptUpdate failed\n");
+		rc = -EINVAL;
+		goto cleanup;
+	}
+	pt_len = len;
+
+	if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, (void *)tag) != 1) {
+		SPDK_ERRLOG("EVP_CTRL_GCM_SET_TAG failed\n");
+		rc = -EINVAL;
+		goto cleanup;
+	}
+
+	if (EVP_DecryptFinal_ex(ctx, pt + pt_len, &len) != 1) {
+		SPDK_ERRLOG("wrapped_key authentication failed (bad tag)\n");
+		rc = -EACCES;
+		goto cleanup;
+	}
+	pt_len += len;
+
+	/* Convert plaintext bytes to hex string for SPDK accel key API */
+	*out_hex = spdk_hexlify((const char *)pt, (size_t)pt_len);
+	if (!*out_hex) {
+		rc = -ENOMEM;
+		goto cleanup;
+	}
+
+	rc = 0;
+
+cleanup:
+	if (ctx) {
+		EVP_CIPHER_CTX_free(ctx);
+	}
+	if (pt) {
+		spdk_memset_s(pt, ct_len, 0, ct_len);
+		free(pt);
+	}
+	if (kek_bin) {
+		spdk_memset_s(kek_bin, kek_len, 0, kek_len);
+		free(kek_bin);
+	}
+	if (blob) {
+		spdk_memset_s(blob, blob_len, 0, blob_len);
+		free(blob);
+	}
+
+	return rc;
 }
 
 /* Decode the parameters for this RPC method and properly construct the crypto
@@ -122,6 +352,37 @@ rpc_bdev_crypto_create(struct spdk_jsonrpc_request *request,
 			spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 							 "Key was not found");
 			goto cleanup;
+		}
+
+		if (req.wrapped_key_b64 || req.wrapped_key2_b64) {
+			if ((!req.kek_id || req.kek_id[0] == '\0') && (!req.kek_hex || req.kek_hex[0] == '\0')) {
+					spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+													 "kek_id (preferred) or kek_hex (fallback) is required when wrapped_key is used");
+					goto cleanup;
+			}
+
+			if (req.wrapped_key_b64) {
+				char *hex = NULL;
+				rc = decrypt_wrapped_key_to_hex(req.wrapped_key_b64, req.kek_id, req.kek_hex, &hex);
+				if (rc) {
+					spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+									 "Failed to decrypt wrapped_key");
+					goto cleanup;
+				}
+				/* Override/define hex_key for accel key creation */
+				req.param.hex_key = hex;
+			}
+
+			if (req.wrapped_key2_b64) {
+				char *hex2 = NULL;
+				rc = decrypt_wrapped_key_to_hex(req.wrapped_key2_b64, req.kek_id, req.kek_hex, &hex2);
+				if (rc) {
+					spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+									 "Failed to decrypt wrapped_key2");
+					goto cleanup;
+				}
+				req.param.hex_key2 = hex2;
+			}
 		}
 
 		if (req.param.cipher == NULL) {
