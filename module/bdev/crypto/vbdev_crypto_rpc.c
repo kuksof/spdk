@@ -64,6 +64,64 @@ static const struct spdk_json_object_decoder rpc_bdev_crypto_create_decoders[] =
 	{"kek_hex", offsetof(struct rpc_construct_crypto, kek_hex), spdk_json_decode_string, true},
 };
 
+static int
+calc_dek_fp_from_hex(const char *hex1, const char *hex2, uint8_t out_fp[VBDEV_CRYPTO_DEK_FP_LEN])
+{
+	uint8_t *k1 = NULL, *k2 = NULL;
+	size_t k1_len = 0, k2_len = 0;
+	EVP_MD_CTX *md = NULL;
+	unsigned int md_len = 0;
+	int rc = -EINVAL;
+
+	if (!hex1 || !hex2 || !out_fp) {
+		return -EINVAL;
+	}
+	if ((strlen(hex1) % 2) || (strlen(hex2) % 2)) {
+		return -EINVAL;
+	}
+
+	k1_len = strlen(hex1) / 2;
+	k2_len = strlen(hex2) / 2;
+
+	k1 = (uint8_t *)spdk_unhexlify(hex1);
+	k2 = (uint8_t *)spdk_unhexlify(hex2);
+	if (!k1 || !k2) {
+		rc = -ENOMEM;
+		goto out;
+	}
+
+	md = EVP_MD_CTX_new();
+	if (!md) {
+		rc = -ENOMEM;
+		goto out;
+	}
+
+	if (EVP_DigestInit_ex(md, EVP_sha256(), NULL) != 1 ||
+		EVP_DigestUpdate(md, k1, k1_len) != 1 ||
+		EVP_DigestUpdate(md, k2, k2_len) != 1 ||
+		EVP_DigestFinal_ex(md, out_fp, &md_len) != 1 ||
+		md_len != VBDEV_CRYPTO_DEK_FP_LEN) {
+		rc = -EINVAL;
+		goto out;
+	}
+
+	rc = 0;
+
+out:
+	if (md) {
+		EVP_MD_CTX_free(md);
+	}
+	if (k1) {
+		spdk_memset_s(k1, k1_len, 0, k1_len);
+		free(k1);
+	}
+	if (k2) {
+		spdk_memset_s(k2, k2_len, 0, k2_len);
+		free(k2);
+	}
+	return rc;
+}
+
 static struct vbdev_crypto_opts *
 create_crypto_opts(struct rpc_construct_crypto *rpc, struct spdk_accel_crypto_key *key,
 		   bool key_owner)
@@ -87,6 +145,26 @@ create_crypto_opts(struct rpc_construct_crypto *rpc, struct spdk_accel_crypto_ke
 
 	opts->key = key;
 	opts->key_owner = key_owner;
+
+	if (rpc->kek_hex && rpc->kek_hex[0] != '\0') {
+		opts->kek_hex = strdup(rpc->kek_hex);
+	}
+	if (rpc->wrapped_key_b64) {
+		opts->wrapped_key_b64 = strdup(rpc->wrapped_key_b64);
+	}
+	if (rpc->wrapped_key2_b64) {
+		opts->wrapped_key2_b64 = strdup(rpc->wrapped_key2_b64);
+	}
+
+	if (rpc->param.hex_key && rpc->param.hex_key2) {
+		int rc = calc_dek_fp_from_hex(rpc->param.hex_key, rpc->param.hex_key2, opts->dek_fp);
+		if (rc != 0) {
+			SPDK_ERRLOG("Failed to calculate DEK fingerprint");
+			free_crypto_opts(opts);
+			return NULL;
+		}
+		opts->dek_fp_valid = true;
+	}
 
 	return opts;
 }
@@ -285,9 +363,9 @@ rpc_bdev_crypto_create(struct spdk_jsonrpc_request *request,
 		key = spdk_accel_crypto_key_get(req.param.key_name);
 		if (key) {
 			if (req.param.hex_key || req.param.cipher || req.crypto_pmd) {
-				SPDK_NOTICELOG("Key name specified, other parameters are ignored\n");
+				SPDK_WARNLOG("Key name specified, other parameters are ignored\n");
 			}
-			SPDK_NOTICELOG("Found key \"%s\"\n", req.param.key_name);
+			SPDK_WARNLOG("Found key \"%s\"\n", req.param.key_name);
 		}
 	}
 
@@ -295,7 +373,7 @@ rpc_bdev_crypto_create(struct spdk_jsonrpc_request *request,
 	if (!key) {
 		if (req.param.key_name) {
 			spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
-							 "Key was not found");
+							 "Key name was not found");
 			goto cleanup;
 		}
 
@@ -447,7 +525,7 @@ rpc_bdev_crypto_update_wrapped_keys(struct spdk_jsonrpc_request *request,
 
 	if (!req.kek_hex || req.kek_hex[0] == '\0') {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
-                                         "kek_hexis required");
+                                         "kek_hex is required");
 		goto out;
 	}
 
@@ -493,6 +571,7 @@ rpc_bdev_crypto_update_wrapped_keys(struct spdk_jsonrpc_request *request,
 
 	free(opts->wrapped_key_b64);
 	free(opts->wrapped_key2_b64);
+	free(opts->kek_hex);
 
 	opts->kek_hex = req.kek_hex ? strdup(req.kek_hex) : NULL;
 	opts->wrapped_key_b64 = strdup(req.wrapped_key_b64);
