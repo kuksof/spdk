@@ -597,7 +597,7 @@ free_crypto_opts(struct vbdev_crypto_opts *opts)
 {
 	free(opts->bdev_name);
 	free(opts->vbdev_name);
-	if (opts->kek_id) { free(opts->kek_id); }
+	if (opts->kek_hex) { free(opts->kek_hex); }
 	if (opts->wrapped_key_b64) { free(opts->wrapped_key_b64); }
 	if (opts->wrapped_key2_b64) { free(opts->wrapped_key2_b64); }
 	spdk_memset_s(opts->dek_fp, sizeof(opts->dek_fp), 0, sizeof(opts->dek_fp));

@@ -27,7 +27,7 @@ struct vbdev_crypto_opts {
 	struct spdk_accel_crypto_key	*key;		/* crypto key */
 	bool				key_owner;	/* If wet to true then the key was created by RPC and needs to be destroyed */
 
-	char *kek_id;              /* preferred */
+	char *kek_hex;
 	char *wrapped_key_b64;
 	char *wrapped_key2_b64;
 
