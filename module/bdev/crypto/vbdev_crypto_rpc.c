@@ -8,6 +8,7 @@
 #include "vbdev_crypto.h"
 
 #include "spdk/hexlify.h"
+#include "spdk/keyring.h"
 
 #include "spdk/base64.h"
 #include "spdk/util.h"
@@ -25,6 +26,7 @@ struct rpc_construct_crypto {
 	struct spdk_accel_crypto_key_create_param param;
 	char *wrapped_key_b64;
 	char *wrapped_key2_b64;
+	char *kek_id;
 	char *kek_hex;
 };
 
@@ -47,6 +49,7 @@ free_rpc_construct_crypto(struct rpc_construct_crypto *r)
 	free(r->param.key_name);
 	free(r->wrapped_key_b64);
 	free(r->wrapped_key2_b64);
+	free(r->kek_id);
 	free(r->kek_hex);
 }
 
@@ -61,66 +64,9 @@ static const struct spdk_json_object_decoder rpc_bdev_crypto_create_decoders[] =
 	{"key_name", offsetof(struct rpc_construct_crypto, param.key_name), spdk_json_decode_string, true},
 	{"wrapped_key", offsetof(struct rpc_construct_crypto, wrapped_key_b64), spdk_json_decode_string, true},
 	{"wrapped_key2", offsetof(struct rpc_construct_crypto, wrapped_key2_b64), spdk_json_decode_string, true},
+	{"kek_id", offsetof(struct rpc_construct_crypto, kek_id), spdk_json_decode_string, true},
 	{"kek_hex", offsetof(struct rpc_construct_crypto, kek_hex), spdk_json_decode_string, true},
 };
-
-static int
-calc_dek_fp_from_hex(const char *hex1, const char *hex2, uint8_t out_fp[VBDEV_CRYPTO_DEK_FP_LEN])
-{
-	uint8_t *k1 = NULL, *k2 = NULL;
-	size_t k1_len = 0, k2_len = 0;
-	EVP_MD_CTX *md = NULL;
-	unsigned int md_len = 0;
-	int rc = -EINVAL;
-
-	if (!hex1 || !hex2 || !out_fp) {
-		return -EINVAL;
-	}
-	if ((strlen(hex1) % 2) || (strlen(hex2) % 2)) {
-		return -EINVAL;
-	}
-
-	k1_len = strlen(hex1) / 2;
-	k2_len = strlen(hex2) / 2;
-
-	k1 = (uint8_t *)spdk_unhexlify(hex1);
-	k2 = (uint8_t *)spdk_unhexlify(hex2);
-	if (!k1 || !k2) {
-		rc = -ENOMEM;
-		goto out;
-	}
-
-	md = EVP_MD_CTX_new();
-	if (!md) {
-		rc = -ENOMEM;
-		goto out;
-	}
-
-	if (EVP_DigestInit_ex(md, EVP_sha256(), NULL) != 1 ||
-		EVP_DigestUpdate(md, k1, k1_len) != 1 ||
-		EVP_DigestUpdate(md, k2, k2_len) != 1 ||
-		EVP_DigestFinal_ex(md, out_fp, &md_len) != 1 ||
-		md_len != VBDEV_CRYPTO_DEK_FP_LEN) {
-		rc = -EINVAL;
-		goto out;
-	}
-
-	rc = 0;
-
-out:
-	if (md) {
-		EVP_MD_CTX_free(md);
-	}
-	if (k1) {
-		spdk_memset_s(k1, k1_len, 0, k1_len);
-		free(k1);
-	}
-	if (k2) {
-		spdk_memset_s(k2, k2_len, 0, k2_len);
-		free(k2);
-	}
-	return rc;
-}
 
 static struct vbdev_crypto_opts *
 create_crypto_opts(struct rpc_construct_crypto *rpc, struct spdk_accel_crypto_key *key,
@@ -146,8 +92,8 @@ create_crypto_opts(struct rpc_construct_crypto *rpc, struct spdk_accel_crypto_ke
 	opts->key = key;
 	opts->key_owner = key_owner;
 
-	if (rpc->kek_hex && rpc->kek_hex[0] != '\0') {
-		opts->kek_hex = strdup(rpc->kek_hex);
+	if (rpc->kek_id && rpc->kek_id[0] != '\0') {
+		opts->kek_id = strdup(rpc->kek_hex);
 	}
 	if (rpc->wrapped_key_b64) {
 		opts->wrapped_key_b64 = strdup(rpc->wrapped_key_b64);
@@ -170,7 +116,147 @@ create_crypto_opts(struct rpc_construct_crypto *rpc, struct spdk_accel_crypto_ke
 }
 
 static int
-decrypt_wrapped_key_to_hex(const char *wrapped_b64, const char *kek_hex, char **out_hex)
+calc_dek_fp_from_hex(const char *hex1, const char *hex2, uint8_t out_fp[VBDEV_CRYPTO_DEK_FP_LEN])
+{
+    uint8_t *k1 = NULL, *k2 = NULL;
+    size_t k1_len = 0, k2_len = 0;
+    EVP_MD_CTX *md = NULL;
+    unsigned int md_len = 0;
+    int rc = -EINVAL;
+
+    if (!hex1 || !hex2 || !out_fp) {
+        return -EINVAL;
+    }
+    if ((strlen(hex1) % 2) || (strlen(hex2) % 2)) {
+        return -EINVAL;
+    }
+
+    k1_len = strlen(hex1) / 2;
+    k2_len = strlen(hex2) / 2;
+
+    k1 = (uint8_t *)spdk_unhexlify(hex1);
+    k2 = (uint8_t *)spdk_unhexlify(hex2);
+    if (!k1 || !k2) {
+        rc = -ENOMEM;
+        goto out;
+    }
+
+    md = EVP_MD_CTX_new();
+    if (!md) {
+        rc = -ENOMEM;
+        goto out;
+    }
+
+    if (EVP_DigestInit_ex(md, EVP_sha256(), NULL) != 1 ||
+        EVP_DigestUpdate(md, k1, k1_len) != 1 ||
+        EVP_DigestUpdate(md, k2, k2_len) != 1 ||
+        EVP_DigestFinal_ex(md, out_fp, &md_len) != 1 ||
+        md_len != VBDEV_CRYPTO_DEK_FP_LEN) {
+        rc = -EINVAL;
+        goto out;
+    }
+
+    rc = 0;
+
+out:
+    if (md) {
+        EVP_MD_CTX_free(md);
+    }
+    if (k1) {
+        spdk_memset_s(k1, k1_len, 0, k1_len);
+        free(k1);
+    }
+    if (k2) {
+        spdk_memset_s(k2, k2_len, 0, k2_len);
+        free(k2);
+    }
+    return rc;
+}
+
+static int
+get_kek_bytes(const char *kek_id, const char *kek_hex, uint8_t **out_kek, size_t *out_len)
+{
+	struct spdk_key *key = NULL;
+	uint8_t *kek = NULL;
+	size_t len = 0;
+	int rc;
+
+	if (out_kek == NULL || out_len == NULL) {
+		return -EINVAL;
+	}
+
+	*out_kek = NULL;
+	*out_len = 0;
+
+	/* Preferred: fetch KEK from SPDK keyring by id */
+	if (kek_id && kek_id[0] != '\0') {
+		key = spdk_keyring_get_key(kek_id);
+		if (key == NULL) {
+			SPDK_ERRLOG("Failed to get KEK from keyring by kek_id='%s'\n", kek_id);
+			return -ENOENT;
+		}
+
+		kek = calloc(1, 32);
+		if (kek == NULL) {
+			spdk_keyring_put_key(key);
+			return -ENOMEM;
+		}
+
+		rc = spdk_key_get_key(key, kek, 32);
+		spdk_keyring_put_key(key);
+
+		if (rc < 0) {
+			SPDK_ERRLOG("Failed to read KEK bytes from keyring kek_id='%s' rc=%d\n", kek_id, rc);
+			spdk_memset_s(kek, 32, 0, 32);
+			free(kek);
+			return rc;
+		}
+
+		if (rc != 32) {
+			SPDK_ERRLOG("KEK from keyring must be %u bytes for AES-256-GCM, got %zu\n",
+				    32, rc);
+			spdk_memset_s(kek, 32, 0, 32);
+			free(kek);
+			return -EINVAL;
+		}
+
+		*out_kek = kek;
+		*out_len = len;
+		return 0;
+	}
+
+	/* Fallback: accept kek_hex (NOT preferred, but ok) */
+	SPDK_ERRLOG("Failed to get KEK from keyring by kek_id='%s'\n", kek_id);
+	if (kek_hex && kek_hex[0] != '\0') {
+		if (strlen(kek_hex) % 2 != 0) {
+			SPDK_ERRLOG("kek_hex length must be even\n");
+			return -EINVAL;
+		}
+
+		len = strlen(kek_hex) / 2;
+		if (len != 32) {
+			SPDK_ERRLOG("kek_hex must be %u bytes (64 hex chars), got %zu bytes\n",
+				    32, len);
+			return -EINVAL;
+		}
+
+		kek = (uint8_t *)spdk_unhexlify(kek_hex);
+		if (kek == NULL) {
+			SPDK_ERRLOG("Failed to unhexlify kek_hex\n");
+			return -EINVAL;
+		}
+
+		*out_kek = kek;
+		*out_len = len;
+		return 0;
+	}
+
+	SPDK_ERRLOG("Neither kek_id nor kek_hex provided\n");
+	return -EINVAL;
+}
+
+static int
+decrypt_wrapped_key_to_hex(const char *wrapped_b64, const char *kek_id, const char *kek_hex, char **out_hex)
 {
 	EVP_CIPHER_CTX *ctx = NULL;
 	uint8_t *blob = NULL;
@@ -190,11 +276,17 @@ decrypt_wrapped_key_to_hex(const char *wrapped_b64, const char *kek_hex, char **
 
 	int rc = -EINVAL;
 
-	if (!wrapped_b64 || !kek_hex || !out_hex) {
+	if (!wrapped_b64 || !kek_id || !out_hex) {
 		return -EINVAL;
 	}
 
 	*out_hex = NULL;
+
+	rc = get_kek_bytes(kek_id, kek_hex, &kek_bin, &kek_len);
+	if (rc != 0) {
+		SPDK_ERRLOG("Failed to obtain KEK\n");
+		goto cleanup;
+	}
 
 	/* Decode base64(wrapped_blob). Format:
 	 * [0..11]   IV (12 bytes)
@@ -378,15 +470,15 @@ rpc_bdev_crypto_create(struct spdk_jsonrpc_request *request,
 		}
 
 		if (req.wrapped_key_b64 || req.wrapped_key2_b64) {
-			if (!req.kek_hex) {
-				spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
-								 "kek_hex is required when wrapped_key/wrapped_key2 is used");
-				goto cleanup;
+			if ((!req.kek_id || req.kek_id[0] == '\0') && (!req.kek_hex || req.kek_hex[0] == '\0')) {
+					spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+													 "kek_id (preferred) or kek_hex (fallback) is required when wrapped_key is used");
+					goto cleanup;
 			}
 
 			if (req.wrapped_key_b64) {
 				char *hex = NULL;
-				rc = decrypt_wrapped_key_to_hex(req.wrapped_key_b64, req.kek_hex, &hex);
+				rc = decrypt_wrapped_key_to_hex(req.wrapped_key_b64, req.kek_id, req.kek_hex, &hex);
 				if (rc) {
 					spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 									 "Failed to decrypt wrapped_key");
@@ -398,7 +490,7 @@ rpc_bdev_crypto_create(struct spdk_jsonrpc_request *request,
 
 			if (req.wrapped_key2_b64) {
 				char *hex2 = NULL;
-				rc = decrypt_wrapped_key_to_hex(req.wrapped_key2_b64, req.kek_hex, &hex2);
+				rc = decrypt_wrapped_key_to_hex(req.wrapped_key2_b64, req.kek_id, req.kek_hex, &hex2);
 				if (rc) {
 					spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 									 "Failed to decrypt wrapped_key2");
@@ -478,7 +570,8 @@ SPDK_RPC_REGISTER("bdev_crypto_create", rpc_bdev_crypto_create, SPDK_RPC_RUNTIME
 
 struct rpc_crypto_update_wrapped {
 	char *name;
-	char *kek_hex;
+	char *kek_id;
+	char *kek_hex;            /* fallback */
 	char *wrapped_key_b64;
 	char *wrapped_key2_b64;
 };
@@ -487,6 +580,7 @@ static void
 free_rpc_crypto_update_wrapped(struct rpc_crypto_update_wrapped *r)
 {
 	free(r->name);
+	free(r->kek_id);
 	free(r->kek_hex);
 	free(r->wrapped_key_b64);
 	free(r->wrapped_key2_b64);
@@ -494,6 +588,7 @@ free_rpc_crypto_update_wrapped(struct rpc_crypto_update_wrapped *r)
 
 static const struct spdk_json_object_decoder rpc_crypto_update_wrapped_decoders[] = {
 	{"name", offsetof(struct rpc_crypto_update_wrapped, name), spdk_json_decode_string},
+	{"kek_id", offsetof(struct rpc_crypto_update_wrapped, kek_id), spdk_json_decode_string, true},
 	{"kek_hex", offsetof(struct rpc_crypto_update_wrapped, kek_hex), spdk_json_decode_string, true},
 	{"wrapped_key", offsetof(struct rpc_crypto_update_wrapped, wrapped_key_b64), spdk_json_decode_string},
 	{"wrapped_key2", offsetof(struct rpc_crypto_update_wrapped, wrapped_key2_b64), spdk_json_decode_string},
@@ -523,9 +618,9 @@ rpc_bdev_crypto_update_wrapped_keys(struct spdk_jsonrpc_request *request,
 		goto out;
 	}
 
-	if (!req.kek_hex || req.kek_hex[0] == '\0') {
+	if ((!req.kek_id || req.kek_id[0] == '\0') && (!req.kek_hex || req.kek_hex[0] == '\0')) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
-                                         "kek_hex is required");
+                                         "kek_id (preferred) or kek_hex (fallback) is required");
 		goto out;
 	}
 
@@ -542,14 +637,14 @@ rpc_bdev_crypto_update_wrapped_keys(struct spdk_jsonrpc_request *request,
 		goto out;
 	}
 
-	rc = decrypt_wrapped_key_to_hex(req.wrapped_key_b64, req.kek_hex, &hex1);
+	rc = decrypt_wrapped_key_to_hex(req.wrapped_key_b64, req.kek_id, req.kek_hex, &hex1);
 	if (rc != 0) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
                                          "Failed to decrypt wrapped_key");
 		goto out;
 	}
 
-	rc = decrypt_wrapped_key_to_hex(req.wrapped_key2_b64, req.kek_hex, &hex2);
+	rc = decrypt_wrapped_key_to_hex(req.wrapped_key2_b64, req.kek_id, req.kek_hex, &hex2);
 	if (rc != 0) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
                                          "Failed to decrypt wrapped_key2");
@@ -569,11 +664,13 @@ rpc_bdev_crypto_update_wrapped_keys(struct spdk_jsonrpc_request *request,
 		goto out;
 	}
 
+	/* update metadata */
+	free(opts->kek_id);
 	free(opts->wrapped_key_b64);
 	free(opts->wrapped_key2_b64);
 	free(opts->kek_hex);
 
-	opts->kek_hex = req.kek_hex ? strdup(req.kek_hex) : NULL;
+	opts->kek_id = req.kek_id ? strdup(req.kek_id) : NULL;
 	opts->wrapped_key_b64 = strdup(req.wrapped_key_b64);
 	opts->wrapped_key2_b64 = strdup(req.wrapped_key2_b64);
 
